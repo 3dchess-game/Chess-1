@@ -4,10 +4,11 @@
  * Edit your VPS IP here (or set environment variable WINC_SERVER).
  * Then: npm install && npm start
  */
-const DEFAULT_RELAY_HOST = "95.217.115.96";
+const DEFAULT_RELAY_HOST = "wss://staging.zenzyvera.store";
 
 const fs = require("node:fs");
 const http = require("node:http");
+const https = require("node:https");
 const net = require("node:net");
 const os = require("node:os");
 const path = require("node:path");
@@ -97,10 +98,23 @@ function formatRelayUrl(parsed) {
   return `${protocol}//${parsed.hostname}:${port}${urlPath}`;
 }
 
+function isIpv4Host(host) {
+  return /^\d{1,3}(\.\d{1,3}){3}$/.test(host);
+}
+
+function hostPartFromServerInput(input) {
+  const trimmed = String(input).trim();
+  if (/^wss?:\/\//i.test(trimmed)) {
+    return new URL(trimmed).hostname;
+  }
+  return trimmed.split("/")[0].split(":")[0];
+}
+
 function normalizeAgentUrl(input) {
   let url = String(input).trim();
   if (!/^wss?:\/\//i.test(url)) {
-    url = `ws://${url}`;
+    const hostPart = hostPartFromServerInput(url);
+    url = isIpv4Host(hostPart) ? `ws://${url}` : `wss://${url}`;
   }
   const parsed = new URL(url);
   if (!parsed.pathname || parsed.pathname === "/") {
@@ -126,11 +140,12 @@ function hostFromServerInput(serverInput) {
   return new URL(normalizeAgentUrl(serverInput)).hostname;
 }
 
-function buildConnectionCandidates(serverInput, token, preferredPort) {
+function buildConnectionCandidates(serverInput, token, preferredPort, preferTls) {
   const normalized = normalizeAgentUrl(serverInput);
   const parsed = new URL(normalized);
   const seen = new Set();
   const list = [];
+  const tlsFirst = preferTls || parsed.protocol === "wss:";
 
   const add = (protocol, port) => {
     const u = new URL(normalized);
@@ -142,6 +157,16 @@ function buildConnectionCandidates(serverInput, token, preferredPort) {
       list.push(withToken);
     }
   };
+
+  if (tlsFirst) {
+    if (preferredPort === 443 || preferredPort === null) {
+      add("wss:", "");
+    } else if (preferredPort) {
+      add("wss:", preferredPort === 443 ? "" : String(preferredPort));
+    }
+    add(parsed.protocol, parsed.port || "");
+    return list;
+  }
 
   if (preferredPort) {
     add("ws:", preferredPort === 80 ? "" : String(preferredPort));
@@ -177,6 +202,37 @@ function tcpProbe(host, port, timeoutMs = 6000) {
   });
 }
 
+function httpsHealth(host, port, timeoutMs = 8000) {
+  return new Promise((resolve) => {
+    const req = https.request(
+      { host, port, path: "/health", method: "GET", timeout: timeoutMs, servername: host },
+      (res) => {
+        let body = "";
+        res.on("data", (c) => {
+          body += c;
+        });
+        res.on("end", () => {
+          if (res.statusCode !== 200) {
+            resolve(false);
+            return;
+          }
+          try {
+            resolve(JSON.parse(body).ok === true);
+          } catch {
+            resolve(false);
+          }
+        });
+      },
+    );
+    req.on("error", () => resolve(false));
+    req.on("timeout", () => {
+      req.destroy();
+      resolve(false);
+    });
+    req.end();
+  });
+}
+
 function httpHealth(host, port, timeoutMs = 8000) {
   return new Promise((resolve) => {
     const req = http.request({ host, port, path: "/health", method: "GET", timeout: timeoutMs }, (res) => {
@@ -205,8 +261,20 @@ function httpHealth(host, port, timeoutMs = 8000) {
   });
 }
 
-async function discoverRelayPort(host) {
+async function discoverRelayPort(host, serverBase) {
   const report = [];
+  const normalized = normalizeAgentUrl(serverBase);
+  const parsed = new URL(normalized);
+  const tlsPreferred = parsed.protocol === "wss:" || !isIpv4Host(host);
+
+  if (tlsPreferred) {
+    if (await httpsHealth(host, 443)) {
+      report.push("  HTTPS :443 /health OK (Hostinger / reverse proxy)");
+      return { port: 443, report, preferTls: true };
+    }
+    report.push("  HTTPS :443 /health failed (check domain SSL and Node app proxy)");
+  }
+
   for (const port of PROBE_PORTS) {
     if (!(await tcpProbe(host, port))) {
       report.push(`  port ${port}: TCP closed (firewall or server not running)`);
@@ -214,11 +282,11 @@ async function discoverRelayPort(host) {
     }
     if (await httpHealth(host, port)) {
       report.push(`  port ${port}: OK (WinC server found)`);
-      return { port, report };
+      return { port, report, preferTls: false };
     }
     report.push(`  port ${port}: TCP open but /health failed`);
   }
-  return { port: null, report };
+  return { port: null, report, preferTls: tlsPreferred };
 }
 
 function normalizeModifier(name) {
@@ -531,9 +599,9 @@ function waitForWebSocketOpen(socket, timeoutMs) {
 async function connectWithFallback(serverBase, token) {
   const host = hostFromServerInput(serverBase);
   console.log(`Discovering WinC server on ${host} …`);
-  const { port: discoveredPort, report } = await discoverRelayPort(host);
+  const { port: discoveredPort, report, preferTls } = await discoverRelayPort(host, serverBase);
   console.log(report.join("\n"));
-  const candidates = buildConnectionCandidates(serverBase, token, discoveredPort);
+  const candidates = buildConnectionCandidates(serverBase, token, discoveredPort, preferTls);
   console.log("WebSocket attempts:");
   for (const url of candidates) console.log(`  → ${url}`);
   let lastError = "unknown error";
@@ -548,8 +616,11 @@ async function connectWithFallback(serverBase, token) {
       safeCloseSocket(socket);
     }
   }
-  const hint = `Open VPS firewall + run server npm start. Test: http://${host}:3847/health`;
-  if (!discoveredPort) throw new Error(`No reachable WinC server on ${host}.\n${hint}`);
+  const hint = preferTls
+    ? `Check https://${host}/health and Hostinger Node proxy (WebSocket /agent).`
+    : `Open firewall + run server. Test: http://${host}:3847/health`;
+  if (!discoveredPort && !preferTls) throw new Error(`No reachable WinC server on ${host}.\n${hint}`);
+  if (!discoveredPort && preferTls) throw new Error(`HTTPS health failed for ${host}.\n${hint}`);
   throw new Error(`WebSocket failed (${lastError}).\n${hint}`);
 }
 
