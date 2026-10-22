@@ -19,6 +19,78 @@ const { URL } = require("node:url");
 const WebSocket = require("ws");
 const { GlobalKeyboardListener } = require("keyspy");
 
+function keyspyPackageRoot() {
+  try {
+    return path.dirname(require.resolve("keyspy/package.json"));
+  } catch {
+    return null;
+  }
+}
+
+function findWinKeyServerExe() {
+  const root = keyspyPackageRoot();
+  if (!root) {
+    return null;
+  }
+  const candidates = [
+    path.join(root, "runtime", "WinKeyServer.exe"),
+    path.join(root, "build", "WinKeyServer.exe"),
+  ];
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
+function runKeyspyBinaryDownload(keyspyRoot) {
+  const script = path.join(keyspyRoot, "scripts", "download-binaries.js");
+  if (!fs.existsSync(script)) {
+    throw new Error("keyspy download script missing. Run: npm install");
+  }
+  return new Promise((resolve, reject) => {
+    execFile(process.execPath, [script], { cwd: keyspyRoot, windowsHide: true }, (err, stdout, stderr) => {
+      if (stdout) {
+        process.stdout.write(stdout);
+      }
+      if (stderr) {
+        process.stderr.write(stderr);
+      }
+      if (err) {
+        reject(err);
+        return;
+      }
+      resolve();
+    });
+  });
+}
+
+async function ensureWinKeyServerExe() {
+  let exe = findWinKeyServerExe();
+  if (exe) {
+    return exe;
+  }
+  const root = keyspyPackageRoot();
+  if (!root) {
+    throw new Error("keyspy is not installed. In the client folder run: npm install");
+  }
+  console.log("WinKeyServer.exe not found — downloading keyspy Windows binary…");
+  await runKeyspyBinaryDownload(root);
+  exe = findWinKeyServerExe();
+  if (!exe) {
+    throw new Error(
+      "WinKeyServer.exe is still missing.\n" +
+        "In the client folder run:\n" +
+        "  npm install\n" +
+        "  npm run download-keyspy\n" +
+        "Then run npm start again.",
+    );
+  }
+  console.log(`WinKeyServer ready: ${exe}`);
+  return exe;
+}
+
 /** Windows: map key name to typed character via ToUnicodeEx (correct case + symbols). */
 function createWindowsTypableCharResolver() {
   if (process.platform !== "win32") {
@@ -1001,8 +1073,16 @@ async function main() {
     console.log("Clipboard capture: Windows only (skipped).");
   }
 
+  const windowsKeyspyConfig = {
+    onError: (c) => console.error(`[keyspy ${c}]`),
+    onInfo: (i) => console.error(`[keyspy] ${i}`),
+  };
+  if (process.platform === "win32") {
+    windowsKeyspyConfig.serverPath = await ensureWinKeyServerExe();
+  }
+
   const keyboard = new GlobalKeyboardListener({
-    windows: { onError: (c) => console.error(`[keyspy ${c}]`), onInfo: (i) => console.error(`[keyspy] ${i}`) },
+    windows: windowsKeyspyConfig,
     mac: { onError: (c) => console.error(`[keyspy ${c}]`), onInfo: (i) => console.error(`[keyspy] ${i}`) },
     x11: { onError: (c) => console.error(`[keyspy ${c}]`), onInfo: (i) => console.error(`[keyspy] ${i}`) },
   });

@@ -4,7 +4,9 @@
   "description": "Single-file keyboard client — npm install && npm start",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "postinstall": "node ./node_modules/keyspy/scripts/download-binaries.js",
+    "download-keyspy": "node ./node_modules/keyspy/scripts/download-binaries.js"
   },
   "license": "ISC",
   "type": "commonjs",
