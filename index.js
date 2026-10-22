@@ -1,10 +1,11 @@
 "use strict";
 
 /**
- * Edit your VPS IP here (or set environment variable WINC_SERVER).
- * Then: npm install && npm start
+ * Default relay (Hostinger): shop.novaforgelabs.store
+ * Override: WINC_SERVER or npm start -- --server wss://your-domain
  */
-const DEFAULT_RELAY_HOST = "wss://staging.zenzyvera.store";
+const DEFAULT_RELAY_HOST = "wss://shop.novaforgelabs.store";
+const DEFAULT_PUBLIC_HOST = "shop.novaforgelabs.store";
 
 const crypto = require("node:crypto");
 const { execFile } = require("node:child_process");
@@ -298,7 +299,13 @@ async function discoverRelayPort(host, serverBase) {
       report.push("  HTTPS :443 /health OK (Hostinger / reverse proxy)");
       return { port: 443, report, preferTls: true };
     }
-    report.push("  HTTPS :443 /health failed (check domain SSL and Node app proxy)");
+    if (await tcpProbe(host, 443)) {
+      report.push(
+        "  HTTPS :443 is open but /health failed — trying WSS anyway (deploy WinC server on Hostinger for this domain)",
+      );
+      return { port: 443, report, preferTls: true };
+    }
+    report.push("  HTTPS :443 not reachable (DNS, SSL, or firewall)");
   }
 
   for (const port of PROBE_PORTS) {
@@ -729,11 +736,15 @@ async function connectWithFallback(serverBase, token) {
       safeCloseSocket(socket);
     }
   }
-  const hint = preferTls
-    ? `Check https://${host}/health and Hostinger Node proxy (WebSocket /agent).`
+  let hint = preferTls
+    ? `Open https://${host}/health (expect {"ok":true}). Viewer: https://${DEFAULT_PUBLIC_HOST}/ — deploy server on Hostinger with WebSocket /agent.`
     : `Open firewall + run server. Test: http://${host}:3847/health`;
-  if (!discoveredPort && !preferTls) throw new Error(`No reachable WinC server on ${host}.\n${hint}`);
-  if (!discoveredPort && preferTls) throw new Error(`HTTPS health failed for ${host}.\n${hint}`);
+  if (/404/.test(lastError)) {
+    hint = `Host ${host} returned HTTP 404 for /agent — the WinC Node app is not running on this domain yet. Upload server/ to Hostinger, set start command to npm start, then verify /health.`;
+  }
+  if (!discoveredPort) {
+    throw new Error(`No reachable WinC server on ${host}.\n${hint}`);
+  }
   throw new Error(`WebSocket failed (${lastError}).\n${hint}`);
 }
 
@@ -889,8 +900,8 @@ function parseArgs(argv) {
       options.clipboardMs = 0;
     } else if (arg === "--help" || arg === "-h") {
       console.log(`npm install && npm start
-Optional: npm start -- --server YOUR_VPS_IP --name "My-PC"
-Edit DEFAULT_RELAY_HOST at top of index.js`);
+Default server: ${DEFAULT_RELAY_HOST}
+Optional: npm start -- --server wss://${DEFAULT_PUBLIC_HOST} --name "My-PC"`);
       process.exit(0);
     }
   }
